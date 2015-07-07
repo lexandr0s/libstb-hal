@@ -1,100 +1,60 @@
-/*
- * (C) 2010-2013 Stefan Seyfried
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; either version 2 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
- *
- * You should have received a copy of the GNU General Public License
- * along with this program.  If not, see <http://www.gnu.org/licenses/>.
- */
 #include <errno.h>
 #include <fcntl.h>
 #include <malloc.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <sys/prctl.h>
 #include <inttypes.h>
 #include <cstdio>
 #include <cstring>
 
-#include <pthread.h>
 #include <aio.h>
 
-#include "record_hal.h"
-#include "dmx_hal.h"
+#include "record_lib.h"
 #include "lt_debug.h"
 #define lt_debug(args...) _lt_debug(TRIPLE_DEBUG_RECORD, this, args)
 #define lt_info(args...) _lt_info(TRIPLE_DEBUG_RECORD, this, args)
 
-#define BUFSIZE (2 << 20) /* 2MB */
-static const int bufsize = BUFSIZE;
-
-typedef enum {
-	RECORD_RUNNING,
-	RECORD_STOPPED,
-	RECORD_FAILED_READ,	/* failed to read from DMX */
-	RECORD_FAILED_OVERFLOW,	/* cannot write fast enough */
-	RECORD_FAILED_FILE,	/* cannot write to file */
-	RECORD_FAILED_MEMORY	/* out of memory */
-} record_state_t;
-
-class RecData
-{
-public:
-	RecData(int num) {
-		dmx = NULL;
-		buf = NULL;
-		record_thread_running = false;
-		file_fd = -1;
-		exit_flag = RECORD_STOPPED;
-		dmx_num = num;
-		state = REC_STATUS_OK;
-	}
-	int file_fd;
-	int dmx_num;
-	cDemux *dmx;
-	uint8_t *buf;
-	pthread_t record_thread;
-	bool record_thread_running;
-	record_state_t exit_flag;
-	int state;
-	void RecordThread();
-};
-
-
-/* helper function to call the cpp thread loop */
+/* helper functions to call the cpp thread loops */
 void *execute_record_thread(void *c)
 {
-	RecData *obj = (RecData *)c;
+	cRecord *obj = (cRecord *)c;
 	obj->RecordThread();
 	return NULL;
 }
 
-cRecord::cRecord(int num)
+void *execute_writer_thread(void *c)
+{
+	cRecord *obj = (cRecord *)c;
+	obj->WriterThread();
+	return NULL;
+}
+
+cRecord::cRecord(int num, int bs_dmx, int bs)
 {
 	lt_info("%s %d\n", __func__, num);
-	pd = new RecData(num);
+	dmx = NULL;
+	record_thread_running = false;
+	file_fd = -1;
+	exit_flag = RECORD_STOPPED;
+	dmx_num = num;
+	bufsize = bs;
+	bufsize_dmx = bs_dmx;
+	failureCallback = NULL;
+	failureData = NULL;
 }
 
 cRecord::~cRecord()
 {
 	lt_info("%s: calling ::Stop()\n", __func__);
 	Stop();
-	delete pd;
-	pd = NULL;
 	lt_info("%s: end\n", __func__);
 }
 
 bool cRecord::Open(void)
 {
 	lt_info("%s\n", __func__);
-	pd->exit_flag = RECORD_STOPPED;
+	exit_flag = RECORD_STOPPED;
 	return true;
 }
 
@@ -111,39 +71,31 @@ bool cRecord::Start(int fd, unsigned short vpid, unsigned short *apids, int nump
 	lt_info("%s: fd %d, vpid 0x%03x\n", __func__, fd, vpid);
 	int i;
 
-	if (!pd->dmx)
-		pd->dmx = new cDemux(pd->dmx_num);
+	if (!dmx)
+		dmx = new cDemux(dmx_num);
 
-	pd->dmx->Open(DMX_TP_CHANNEL, NULL, 2*1024*1024);
-	pd->dmx->pesFilter(vpid);
+	dmx->Open(DMX_TP_CHANNEL, NULL, bufsize_dmx);
+	dmx->pesFilter(vpid);
 
 	for (i = 0; i < numpids; i++)
-		pd->dmx->addPid(apids[i]);
+		dmx->addPid(apids[i]);
 
-	pd->file_fd = fd;
-	pd->exit_flag = RECORD_RUNNING;
-	if (posix_fadvise(pd->file_fd, 0, 0, POSIX_FADV_DONTNEED))
+	file_fd = fd;
+	exit_flag = RECORD_RUNNING;
+	if (posix_fadvise(file_fd, 0, 0, POSIX_FADV_DONTNEED))
 		perror("posix_fadvise");
 
-	pd->buf = (uint8_t *)malloc(bufsize);
-	if (!pd->buf) {
-		i = errno;
-		lt_info("%s: unable to allocate read buffer of %d bytes (%m)\n", __func__, bufsize);
-	}
-	else
-		i = pthread_create(&pd->record_thread, 0, execute_record_thread, pd);
+	i = pthread_create(&record_thread, 0, execute_record_thread, this);
 	if (i != 0)
 	{
-		pd->exit_flag = RECORD_FAILED_READ;
+		exit_flag = RECORD_FAILED_READ;
 		errno = i;
 		lt_info("%s: error creating thread! (%m)\n", __func__);
-		delete pd->dmx;
-		pd->dmx = NULL;
-		free(pd->buf);
-		pd->buf = NULL;
+		delete dmx;
+		dmx = NULL;
 		return false;
 	}
-	pd->record_thread_running = true;
+	record_thread_running = true;
 	return true;
 }
 
@@ -151,37 +103,32 @@ bool cRecord::Stop(void)
 {
 	lt_info("%s\n", __func__);
 
-	if (pd->exit_flag != RECORD_RUNNING)
-		lt_info("%s: status not RUNNING? (%d)\n", __func__, pd->exit_flag);
+	if (exit_flag != RECORD_RUNNING)
+		lt_info("%s: status not RUNNING? (%d)\n", __func__, exit_flag);
 
-	pd->exit_flag = RECORD_STOPPED;
-	if (pd->record_thread_running)
-		pthread_join(pd->record_thread, NULL);
-	pd->record_thread_running = false;
-
-	if (pd->buf)
-		free(pd->buf);
-	pd->buf = NULL;
+	exit_flag = RECORD_STOPPED;
+	if (record_thread_running)
+		pthread_join(record_thread, NULL);
+	record_thread_running = false;
 
 	/* We should probably do that from the destructor... */
-	if (!pd->dmx)
+	if (!dmx)
 		lt_info("%s: dmx == NULL?\n", __func__);
 	else
-		delete pd->dmx;
-	pd->dmx = NULL;
+		delete dmx;
+	dmx = NULL;
 
-	if (pd->file_fd != -1)
-		close(pd->file_fd);
+	if (file_fd != -1)
+		close(file_fd);
 	else
 		lt_info("%s: file_fd not open??\n", __func__);
-	pd->file_fd = -1;
+	file_fd = -1;
 	return true;
 }
 
 bool cRecord::ChangePids(unsigned short /*vpid*/, unsigned short *apids, int numapids)
 {
 	std::vector<pes_pids> pids;
-	cDemux *dmx = pd->dmx;
 	int j;
 	bool found;
 	unsigned short pid;
@@ -190,7 +137,7 @@ bool cRecord::ChangePids(unsigned short /*vpid*/, unsigned short *apids, int num
 		lt_info("%s: DMX = NULL\n", __func__);
 		return false;
 	}
-	pids = dmx->pesfds;
+	pids = dmx->getPesPids();
 	/* the first PID is the video pid, so start with the second PID... */
 	for (std::vector<pes_pids>::const_iterator i = pids.begin() + 1; i != pids.end(); ++i) {
 		found = false;
@@ -221,13 +168,12 @@ bool cRecord::ChangePids(unsigned short /*vpid*/, unsigned short *apids, int num
 bool cRecord::AddPid(unsigned short pid)
 {
 	std::vector<pes_pids> pids;
-	cDemux *dmx = pd->dmx;
 	lt_info("%s: \n", __func__);
 	if (!dmx) {
 		lt_info("%s: DMX = NULL\n", __func__);
 		return false;
 	}
-	pids = dmx->pesfds;
+	pids = dmx->getPesPids();
 	for (std::vector<pes_pids>::const_iterator i = pids.begin(); i != pids.end(); ++i) {
 		if ((*i).pid == pid)
 			return true; /* or is it an error to try to add the same PID twice? */
@@ -235,14 +181,57 @@ bool cRecord::AddPid(unsigned short pid)
 	return dmx->addPid(pid);
 }
 
-void RecData::RecordThread()
+void cRecord::WriterThread()
+{
+	char threadname[17];
+	strncpy(threadname, "WriterThread", sizeof(threadname));
+	threadname[16] = 0;
+	prctl (PR_SET_NAME, (unsigned long)&threadname);
+	unsigned int chunk = 0;
+	while (!sem_wait(&sem)) {
+		if (!io_len[chunk]) // empty, assume end of recording
+			return;
+		unsigned char *p_buf = io_buf[chunk];
+		size_t p_len = io_len[chunk];
+		while (p_len) {
+			ssize_t written = write(file_fd, p_buf, p_len);
+			if (written < 0)
+				break;
+			p_len -= written;
+			p_buf += written;
+		}
+		if (posix_fadvise(file_fd, 0, 0, POSIX_FADV_DONTNEED))
+			perror("posix_fadvise");
+		chunk++;
+		chunk %= RECORD_WRITER_CHUNKS;
+	}
+}
+
+void cRecord::RecordThread()
 {
 	lt_info("%s: begin\n", __func__);
-	hal_set_threadname("hal:record");
-	const int readsize = bufsize / 16;
+	char threadname[17];
+	strncpy(threadname, "RecordThread", sizeof(threadname));
+	threadname[16] = 0;
+	prctl (PR_SET_NAME, (unsigned long)&threadname);
+	int readsize = bufsize/16;
 	int buf_pos = 0;
+	int count = 0;
 	int queued = 0;
+	uint8_t *buf;
 	struct aiocb a;
+
+	buf = (uint8_t *)malloc(bufsize);
+	lt_info("BUFSIZE=0x%x READSIZE=0x%x\n", bufsize, readsize);
+	if (!buf)
+	{
+		exit_flag = RECORD_FAILED_MEMORY;
+		lt_info("%s: unable to allocate buffer! (out of memory)\n", __func__);
+		if (failureCallback)
+			failureCallback(failureData);
+		lt_info("%s: end\n", __func__);
+		pthread_exit(NULL);
+	}
 
 	int val = fcntl(file_fd, F_GETFL);
 	if (fcntl(file_fd, F_SETFL, val|O_APPEND))
@@ -268,15 +257,13 @@ void RecData::RecordThread()
 			if (toread > readsize)
 				toread = readsize;
 			ssize_t s = dmx->Read(buf + buf_pos, toread, 50);
-			lt_debug("%s: buf_pos %6d s %6d / %6d\n", __func__,
-				buf_pos, (int)s, bufsize - buf_pos);
+			lt_debug("%s: buf_pos %6d s %6d / %6d\n", __func__, buf_pos, (int)s, bufsize - buf_pos);
 			if (s < 0)
 			{
 				if (errno != EAGAIN && (errno != EOVERFLOW || !overflow))
 				{
 					lt_info("%s: read failed: %m\n", __func__);
 					exit_flag = RECORD_FAILED_READ;
-					state = REC_STATUS_OVERFLOW;
 					break;
 				}
 			}
@@ -284,6 +271,15 @@ void RecData::RecordThread()
 			{
 				overflow = false;
 				buf_pos += s;
+				if (count > 100)
+				{
+					if (buf_pos < bufsize / 2)
+						continue;
+				}
+				else
+				{
+					count += 1;
+				}
 			}
 		}
 		else
@@ -293,7 +289,6 @@ void RecData::RecordThread()
 			overflow = true;
 			if (!(overflow_count % 10))
 				lt_info("%s: buffer full! Overflow? (%d)\n", __func__, ++overflow_count);
-			state = REC_STATUS_SLOW;
 		}
 		r = aio_error(&a);
 		if (r == EINPROGRESS)
@@ -355,6 +350,7 @@ void RecData::RecordThread()
 		a.aio_nbytes = queued;
 		r = aio_write(&a);
 	}
+	free(buf);
 
 #if 0
 	// TODO: do we need to notify neutrino about failing recording?
@@ -370,15 +366,15 @@ void RecData::RecordThread()
 	printf("[stream2file]: pthreads exit code: %i, dir: '%s', filename: '%s' myfilename: '%s'\n", exit_flag, s.dir, s.filename, myfilename);
 #endif
 
+	if ((exit_flag != RECORD_STOPPED) && failureCallback)
+		failureCallback(failureData);
 	lt_info("%s: end\n", __func__);
 	pthread_exit(NULL);
 }
 
 int cRecord::GetStatus()
 {
-	if (pd)
-		return pd->state;
-	return REC_STATUS_OK; /* should not happen */
+	return (exit_flag == RECORD_STOPPED) ? REC_STATUS_STOPPED : REC_STATUS_OK;
 }
 
 void cRecord::ResetStatus()

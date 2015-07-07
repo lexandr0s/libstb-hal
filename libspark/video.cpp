@@ -36,12 +36,8 @@
 #include <linux/fb.h>
 #include <linux/stmfb.h>
 #include <bpamem.h>
-#include "video_hal.h"
-#include "video_priv.h"
+#include "video_lib.h"
 #include "lt_debug.h"
-
-#include <proc_tools.h>
-
 #define lt_debug(args...) _lt_debug(TRIPLE_DEBUG_VIDEO, this, args)
 #define lt_info(args...) _lt_info(TRIPLE_DEBUG_VIDEO, this, args)
 #define lt_debug_c(args...) _lt_debug(TRIPLE_DEBUG_VIDEO, NULL, args)
@@ -65,6 +61,7 @@ cVideo * pipDecoder = NULL;
 int system_rev = 0;
 
 static bool hdmi_enabled = true;
+static bool stillpicture = false;
 
 static const char *VDEV[] = {
 	"/dev/dvb/adapter0/video0",
@@ -103,6 +100,46 @@ static const char *VMPEG_framerate[] = {
 #define VIDEO_STREAMTYPE_VC1_SM 5
 #define VIDEO_STREAMTYPE_MPEG1 6
 
+
+static int proc_put(const char *path, const char *value, const int len)
+{
+	int ret, ret2;
+	int pfd = open(path, O_WRONLY);
+	if (pfd < 0)
+		return pfd;
+	ret = write(pfd, value, len);
+	ret2 = close(pfd);
+	if (ret2 < 0)
+		return ret2;
+	return ret;
+}
+
+static int proc_get(const char *path, char *value, const int len)
+{
+	int ret, ret2;
+	int pfd = open(path, O_RDONLY);
+	if (pfd < 0)
+		return pfd;
+	ret = read(pfd, value, len);
+	value[len-1] = '\0'; /* make sure string is terminated */
+	while (ret > 0 && isspace(value[ret-1]))
+		value[--ret] = '\0';	/* remove trailing whitespace */
+	ret2 = close(pfd);
+	if (ret2 < 0)
+		return ret2;
+	return ret;
+}
+
+static unsigned int proc_get_hex(const char *path)
+{
+	unsigned int n, ret = 0;
+	char buf[16];
+	n = proc_get(path, buf, 16);
+	if (n > 0)
+		sscanf(buf, "%x", &ret);
+	return ret;
+}
+
 static int hdmi_out(bool enable)
 {
 	struct stmfbio_output_configuration out;
@@ -140,21 +177,15 @@ out:
 
 cVideo::cVideo(int, void *, void *, unsigned int unit)
 {
-	vdec = new VDec(unit);
-}
-
-cVideo::~cVideo(void)
-{
-	delete vdec;
-	vdec = NULL;
-}
-
-VDec::VDec(unsigned int unit)
-{
 	lt_debug("%s unit %u\n", __func__, unit);
 
+	brightness = -1;
+	contrast = -1;
+	saturation = -1;
+	hue = -1;
+
+	scartvoltage = -1;
 	video_standby = 0;
-	stillpicture = false;
 	if (unit > 1) {
 		lt_info("%s: unit %d out of range, setting to 0\n", __func__, unit);
 		devnum = 0;
@@ -164,12 +195,12 @@ VDec::VDec(unsigned int unit)
 	openDevice();
 }
 
-VDec::~VDec(void)
+cVideo::~cVideo(void)
 {
 	closeDevice();
 }
 
-void VDec::openDevice(void)
+void cVideo::openDevice(void)
 {
 	int n = 0;
 	lt_debug("#%d: %s\n", devnum, __func__);
@@ -191,7 +222,7 @@ retry:
 	playstate = VIDEO_STOPPED;
 }
 
-void VDec::closeDevice(void)
+void cVideo::closeDevice(void)
 {
 	lt_debug("%s\n", __func__);
 	/* looks like sometimes close is unhappy about non-empty buffers */
@@ -231,11 +262,6 @@ int cVideo::setAspectRatio(int aspect, int mode)
 
 int cVideo::getAspectRatio(void)
 {
-	return vdec->getAspectRatio();
-}
-
-int VDec::getAspectRatio(void)
-{
 	video_size_t s;
 	if (fd == -1)
 	{
@@ -252,7 +278,7 @@ int VDec::getAspectRatio(void)
 	return s.aspect_ratio * 2 + 1;
 }
 
-int cVideo::setCroppingMode(void)
+int cVideo::setCroppingMode(int /*vidDispMode_t format*/)
 {
 	return 0;
 #if 0
@@ -270,16 +296,6 @@ int cVideo::setCroppingMode(void)
 
 int cVideo::Start(void * /*PcrChannel*/, unsigned short /*PcrPid*/, unsigned short /*VideoPid*/, void * /*hChannel*/)
 {
-	return vdec->Start();
-}
-
-int cVideo::Stop(bool blank)
-{
-	return vdec->Stop(blank);
-}
-
-int VDec::Start(void)
-{
 	lt_debug("#%d: %s playstate=%d\n", devnum, __func__, playstate);
 #if 0
 	if (playstate == VIDEO_PLAYING)
@@ -289,10 +305,27 @@ int VDec::Start(void)
 #endif
 	playstate = VIDEO_PLAYING;
 	fop(ioctl, VIDEO_SELECT_SOURCE, VIDEO_SOURCE_DEMUX);
-	return fop(ioctl, VIDEO_PLAY);
+	int res = fop(ioctl, VIDEO_PLAY);
+	if (brightness > -1) {
+		SetControl(VIDEO_CONTROL_BRIGHTNESS, brightness);
+		brightness = -1;
+	}
+	if (contrast > -1) {
+		SetControl(VIDEO_CONTROL_CONTRAST, contrast);
+		contrast = -1;
+	}
+	if (saturation > -1) {
+		SetControl(VIDEO_CONTROL_SATURATION, saturation);
+		saturation = -1;
+	}
+	if (hue > -1) {
+		SetControl(VIDEO_CONTROL_HUE, hue);
+		hue = -1;
+	}
+	return res;
 }
 
-int VDec::Stop(bool blank)
+int cVideo::Stop(bool blank)
 {
 	lt_debug("#%d: %s(%d)\n", devnum, __func__, blank);
 	if (stillpicture)
@@ -306,6 +339,10 @@ int VDec::Stop(bool blank)
 
 int cVideo::setBlank(int)
 {
+	fop(ioctl, VIDEO_PLAY);
+	fop(ioctl, VIDEO_CONTINUE);
+	video_still_picture sp = { NULL, 0 };
+	fop(ioctl, VIDEO_STILLPICTURE, &sp);
 	return Stop(1);
 }
 
@@ -343,7 +380,7 @@ int cVideo::SetVideoSystem(int video_system, bool remember)
 	}
 	lt_info("%s: old: '%s' new: '%s'\n", __func__, current, modes[video_system]);
 	bool stopped = false;
-	if (vdec->playstate == VIDEO_PLAYING)
+	if (playstate == VIDEO_PLAYING)
 	{
 		lt_info("%s: playstate == VIDEO_PLAYING, stopping video\n", __func__);
 		Stop();
@@ -360,12 +397,12 @@ int cVideo::SetVideoSystem(int video_system, bool remember)
 
 int cVideo::getPlayState(void)
 {
-	return vdec->playstate;
+	return playstate;
 }
 
 void cVideo::SetVideoMode(analog_mode_t mode)
 {
-	lt_debug("#%d: %s(%d)\n", vdec->devnum, __func__, mode);
+	lt_debug("#%d: %s(%d)\n", devnum, __func__, mode);
 	if (!(mode & ANALOG_SCART_MASK))
 	{
 		lt_debug("%s: non-SCART mode ignored\n", __func__);
@@ -388,14 +425,11 @@ void cVideo::SetVideoMode(analog_mode_t mode)
 	proc_put("/proc/stb/avs/0/colorformat", m, strlen(m));
 }
 
-void cVideo::ShowPicture(const char * fname)
-{
-	vdec->ShowPicture(fname);
-}
-
-void VDec::ShowPicture(const char * fname)
+void cVideo::ShowPicture(const char * fname, const char *_destname)
 {
 	lt_debug("%s(%s)\n", __func__, fname);
+	static const unsigned char pes_header[] = { 0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00 };
+	static const unsigned char seq_end[] = { 0x00, 0x00, 0x01, 0xB7 };
 	char destname[512];
 	char cmd[512];
 	char *p;
@@ -407,33 +441,42 @@ void VDec::ShowPicture(const char * fname)
 		lt_info("%s: video_standby == true\n", __func__);
 		return;
 	}
-	strcpy(destname, "/var/cache");
-	if (stat(fname, &st2))
-	{
-		lt_info("%s: could not stat %s (%m)\n", __func__, fname);
-		return;
-	}
-	mkdir(destname, 0755);
-	/* the cache filename is (example for /share/tuxbox/neutrino/icons/radiomode.jpg):
-	   /var/cache/share.tuxbox.neutrino.icons.radiomode.jpg.m2v
-	   build that filename first...
-	   TODO: this could cause name clashes, use a hashing function instead... */
-	strcat(destname, fname);
-	p = &destname[strlen("/var/cache/")];
-	while ((p = strchr(p, '/')) != NULL)
-		*p = '.';
-	strcat(destname, ".m2v");
-	/* ...then check if it exists already... */
-	if (stat(destname, &st) || (st.st_mtime != st2.st_mtime) || (st.st_size == 0))
-	{
-		struct utimbuf u;
-		u.actime = time(NULL);
-		u.modtime = st2.st_mtime;
-		/* it does not exist or has a different date, so call ffmpeg... */
-		sprintf(cmd, "ffmpeg -y -f mjpeg -i '%s' -s 1280x720 '%s' </dev/null",
-							fname, destname);
-		system(cmd); /* TODO: use libavcodec to directly convert it */
-		utime(destname, &u);
+	const char *lastDot = strrchr(fname, '.');
+	if (lastDot && !strcasecmp(lastDot + 1, "m2v"))
+		strncpy(destname, fname, sizeof(destname));
+	else {
+		if (_destname)
+			strncpy(destname, _destname, sizeof(destname));
+		else {
+			strcpy(destname, "/tmp/cache");
+			if (stat(fname, &st2))
+			{
+				lt_info("%s: could not stat %s (%m)\n", __func__, fname);
+				return;
+			}
+			mkdir(destname, 0755);
+			/* the cache filename is (example for /share/tuxbox/neutrino/icons/radiomode.jpg):
+			   /var/cache/share.tuxbox.neutrino.icons.radiomode.jpg.m2v
+			   build that filename first...
+			   TODO: this could cause name clashes, use a hashing function instead... */
+			strcat(destname, fname);
+			p = &destname[strlen("/tmp/cache/")];
+			while ((p = strchr(p, '/')) != NULL)
+				*p = '.';
+			strcat(destname, ".m2v");
+		}
+		/* ...then check if it exists already... */
+		if (stat(destname, &st) || (st.st_mtime != st2.st_mtime) || (st.st_size == 0))
+		{
+			struct utimbuf u;
+			u.actime = time(NULL);
+			u.modtime = st2.st_mtime;
+			/* it does not exist or has a different date, so call ffmpeg... */
+			sprintf(cmd, "ffmpeg -y -f mjpeg -i '%s' -s 1280x720 -aspect 16:9 '%s' </dev/null",
+								fname, destname);
+			system(cmd); /* TODO: use libavcodec to directly convert it */
+			utime(destname, &u);
+		}
 	}
 	mfd = open(destname, O_RDONLY);
 	if (mfd < 0)
@@ -452,17 +495,30 @@ void VDec::ShowPicture(const char * fname)
 
 		if (ioctl(fd, VIDEO_SET_FORMAT, VIDEO_FORMAT_16_9) < 0)
 			lt_info("%s: VIDEO_SET_FORMAT failed (%m)\n", __func__);
-		char *iframe = (char *)malloc(st.st_size);
+		bool seq_end_avail = false;
+		off_t pos=0;
+		unsigned char *iframe = (unsigned char *)malloc((st.st_size < 8192) ? 8192 : st.st_size);
 		if (! iframe)
 		{
 			lt_info("%s: malloc failed (%m)\n", __func__);
 			goto out;
 		}
 		read(mfd, iframe, st.st_size);
-		fop(ioctl, VIDEO_PLAY);
-		fop(ioctl, VIDEO_CONTINUE);
-		video_still_picture sp = { iframe, st.st_size };
-		fop(ioctl, VIDEO_STILLPICTURE, &sp);
+		ioctl(fd, VIDEO_SELECT_SOURCE, VIDEO_SOURCE_MEMORY);
+		ioctl(fd, VIDEO_PLAY);
+		ioctl(fd, VIDEO_CONTINUE);
+		ioctl(fd, VIDEO_CLEAR_BUFFER);
+		while (pos <= (st.st_size-4) && !(seq_end_avail = (!iframe[pos] && !iframe[pos+1] && iframe[pos+2] == 1 && iframe[pos+3] == 0xB7)))
+			++pos;
+
+		if ((iframe[3] >> 4) != 0xE) // no pes header
+			write(fd, pes_header, sizeof(pes_header));
+		write(fd, iframe, st.st_size);
+		if (!seq_end_avail)
+			write(fd, seq_end, sizeof(seq_end));
+		memset(iframe, 0, 8192);
+		write(fd, iframe, 8192);
+		ioctl(fd, VIDEO_SELECT_SOURCE, VIDEO_SOURCE_DEMUX);
 		free(iframe);
 	}
  out:
@@ -473,16 +529,11 @@ void VDec::ShowPicture(const char * fname)
 void cVideo::StopPicture()
 {
 	lt_debug("%s\n", __func__);
-	vdec->stillpicture = false;
+	stillpicture = false;
 	Stop(1);
 }
 
 void cVideo::Standby(unsigned int bOn)
-{
-	vdec->Standby(bOn);
-}
-
-void VDec::Standby(unsigned int bOn)
 {
 	lt_debug("%s(%d)\n", __func__, bOn);
 	if (bOn)
@@ -521,10 +572,10 @@ int cVideo::getBlank(void)
 		return 0;
 	while ((r = getline(&line, &n, f)) != -1)
 	{
-		if (r < 8) /* strlen("mailbox") + 1, should not happen... */
+		if (r <= (ssize_t) strlen("mailbox")) /* should not happen... */
 			continue;
 		line[r - 1] = 0; /* remove \n */
-		if (!strcmp(&line[r - 8], "mailbox"))
+		if (!strcmp(&line[r - 1 - strlen("mailbox")], "mailbox"))
 		{
 			count =  atoi(line + 5);
 			break;
@@ -533,12 +584,31 @@ int cVideo::getBlank(void)
 	free(line);
 	fclose(f);
 	int ret = (count == lastcount); /* no new decode -> return 1 */
-	lt_debug("#%d: %s: %d (irq++: %d)\n", vdec->devnum, __func__, ret, count - lastcount);
+	lt_debug("#%d: %s: %d (irq++: %d)\n", devnum, __func__, ret, count - lastcount);
 	lastcount = count;
 	return ret;
 }
 
-void cVideo::Pig(int x, int y, int w, int h, int osd_w, int osd_h)
+/* this function is regularly called, checks if video parameters
+   changed and triggers appropriate actions */
+void cVideo::VideoParamWatchdog(void)
+{
+#if 0
+	static unsigned int _v_info = (unsigned int) -1;
+	unsigned int v_info;
+	if (fd == -1)
+		return;
+	ioctl(fd, MPEG_VID_GET_V_INFO_RAW, &v_info);
+	if (_v_info != v_info)
+	{
+		lt_debug("%s params changed. old: %08x new: %08x\n", __FUNCTION__, _v_info, v_info);
+		setAspectRatio(-1, -1);
+	}
+	_v_info = v_info;
+#endif
+}
+
+void cVideo::Pig(int x, int y, int w, int h, int osd_w, int osd_h, int startx, int starty, int endx, int endy)
 {
 	char buffer[64];
 	int _x, _y, _w, _h;
@@ -546,7 +616,7 @@ void cVideo::Pig(int x, int y, int w, int h, int osd_w, int osd_h)
 	 * TODO: check this in the driver sources */
 	int xres = 720; /* proc_get_hex("/proc/stb/vmpeg/0/xres") */
 	int yres = 576; /* proc_get_hex("/proc/stb/vmpeg/0/yres") */
-	lt_debug("#%d %s: x:%d y:%d w:%d h:%d ow:%d oh:%d\n", vdec->devnum, __func__, x, y, w, h, osd_w, osd_h);
+	lt_debug("#%d %s: x:%d y:%d w:%d h:%d ow:%d oh:%d\n", devnum, __func__, x, y, w, h, osd_w, osd_h);
 	if (x == -1 && y == -1 && w == -1 && h == -1)
 	{
 		_w = xres;
@@ -556,14 +626,25 @@ void cVideo::Pig(int x, int y, int w, int h, int osd_w, int osd_h)
 	}
 	else
 	{
+		// need to do some additional adjustments because osd border is handled by blitter
+		x += startx;
+		x *= endx - startx + 1;
+		y += starty;
+		y *= endy - starty + 1;
+		w *= endx - startx + 1;
+		h *= endy - starty + 1;
 		_x = x * xres / osd_w;
 		_w = w * xres / osd_w;
 		_y = y * yres / osd_h;
 		_h = h * yres / osd_h;
+		_x /= 1280;
+		_y /= 720;
+		_w /= 1280;
+		_h /= 720;
 	}
-	lt_debug("#%d %s: x:%d y:%d w:%d h:%d xr:%d yr:%d\n", vdec->devnum, __func__, _x, _y, _w, _h, xres, yres);
+	lt_debug("#%d %s: x:%d y:%d w:%d h:%d xr:%d yr:%d\n", devnum, __func__, _x, _y, _w, _h, xres, yres);
 	sprintf(buffer, "%x %x %x %x", _x, _y, _w, _h);
-	proc_put(VMPEG_dst_all[vdec->devnum], buffer, strlen(buffer));
+	proc_put(VMPEG_dst_all[devnum], buffer, strlen(buffer));
 }
 
 static inline int rate2csapi(int rate)
@@ -593,11 +674,6 @@ static inline int rate2csapi(int rate)
 }
 
 void cVideo::getPictureInfo(int &width, int &height, int &rate)
-{
-	vdec->getPictureInfo(width, height, rate);
-}
-
-void VDec::getPictureInfo(int &width, int &height, int &rate)
 {
 	video_size_t s;
 	int r;
@@ -636,11 +712,6 @@ void cVideo::SetSyncMode(AVSYNC_TYPE mode)
 
 int cVideo::SetStreamType(VIDEO_FORMAT type)
 {
-	return vdec->SetStreamType(type);
-}
-
-int VDec::SetStreamType(VIDEO_FORMAT type)
-{
 	static const char *VF[] = {
 		"VIDEO_FORMAT_MPEG2",
 		"VIDEO_FORMAT_MPEG4",
@@ -671,7 +742,7 @@ int VDec::SetStreamType(VIDEO_FORMAT type)
 	return 0;
 }
 
-int64_t VDec::GetPTS(void)
+int64_t cVideo::GetPTS(void)
 {
 	int64_t pts = 0;
 	if (ioctl(fd, VIDEO_GET_PTS, &pts) < 0)
@@ -681,7 +752,64 @@ int64_t VDec::GetPTS(void)
 
 void cVideo::SetDemux(cDemux *)
 {
-	lt_debug("#%d %s not implemented yet\n", vdec->devnum, __func__);
+	lt_debug("#%d %s not implemented yet\n", devnum, __func__);
+}
+
+void cVideo::SetControl(int control, int value) {
+	const char *p = NULL;
+	switch (control) {
+	case VIDEO_CONTROL_BRIGHTNESS:
+		brightness = value;
+		p = "/proc/stb/video/plane/psi_brightness";
+		break;
+	case VIDEO_CONTROL_CONTRAST:
+		contrast = value;
+		p = "/proc/stb/video/plane/psi_contrast";
+		break;
+	case VIDEO_CONTROL_SATURATION:
+		saturation = value;
+		p = "/proc/stb/video/plane/psi_saturation";
+		break;
+	case VIDEO_CONTROL_HUE:
+		hue = value;
+		p = "/proc/stb/video/plane/psi_tint";
+		break;
+	}
+	if (p) {
+		char buf[20];
+		int len = snprintf(buf, sizeof(buf), "%d", value);
+		if (len < (int) sizeof(buf))
+			proc_put(p, buf, len);
+	}
+}
+
+void cVideo::SetColorFormat(COLOR_FORMAT color_format) {
+	const char *p = NULL;
+	switch(color_format) {
+	case COLORFORMAT_RGB:
+		p = "rgb";
+		break;
+	case COLORFORMAT_YUV:
+		p = "yuv";
+		break;
+	case COLORFORMAT_CVBS:
+		p = "cvbs";
+		break;
+	case COLORFORMAT_SVIDEO:
+		p = "svideo";
+		break;
+	case COLORFORMAT_HDMI_RGB:
+		p = "hdmi_rgb";
+		break;
+	case COLORFORMAT_HDMI_YCBCR444:
+		p = "hdmi_yuv";
+		break;
+	case COLORFORMAT_HDMI_YCBCR422:
+		p = "hdmi_422";
+		break;
+	}
+	if (p)
+		proc_put("/proc/stb/avs/0/colorformat", p, strlen(p));
 }
 
 /* get an image of the video screen

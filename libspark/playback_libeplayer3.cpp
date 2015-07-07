@@ -1,85 +1,38 @@
-/*
- * CPlayback implementation for SH4 using libeplayer3
- *
- * (C) 2010-2015 Stefan Seyfried
- *
- * original code is from tdt git:
- *   git://gitorious.org/open-duckbox-project-sh4/tdt.git
- *
- * lots of changes and huge improvements are
- * (C) 2013,2014 'martii' <m4rtii@gmx.de>
- *
- * License: GPLv2 or later, as the rest of libstb-hal
- */
-
+#define __USE_FILE_OFFSET64 1
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include <audio_priv.h>
-#include <video_priv.h>
+#include <audio_lib.h>
+#include <video_lib.h>
 
 #include "player.h"
-//#include "playback_libeplayer3.h"
-#include "playback_hal.h"
+#include "playback_libeplayer3.h"
 #include "lt_debug.h"
 
 #define lt_debug(args...) _lt_debug(HAL_DEBUG_PLAYBACK, this, args)
 #define lt_info(args...)  _lt_info(HAL_DEBUG_PLAYBACK, this, args)
 
-
-extern ADec *adec;
+extern cAudio *audioDecoder;
 extern cVideo *videoDecoder;
-static bool decoders_closed = false;
 
-static playmode_t pm;
-static std::string fn_ts;
-static std::string fn_xml;
-static off_t last_size;
-static int init_jump;
-
-class PBPrivate
-{
-public:
-	bool enabled;
-	bool playing;
-	int speed;
-	int astream;
-	Player *player;
-	PBPrivate() {
-		enabled = false;
-		playing = false;
-		speed = 0;
-		astream = -1;
-		player = new Player;
-	};
-	~PBPrivate() {
-		delete player;
-	};
-};
-
+//Used by Fileplay
 bool cPlayback::Open(playmode_t PlayMode)
 {
-	const char *aPLAYMODE[] = {
-		"PLAYMODE_TS",
-		"PLAYMODE_FILE"
-	};
-
 	if (PlayMode != PLAYMODE_TS)
 	{
-		adec->closeDevice();
-		videoDecoder->vdec->closeDevice();
+		audioDecoder->closeDevice();
+		videoDecoder->closeDevice();
 		decoders_closed = true;
 	}
 
-	lt_info("%s - PlayMode=%s\n", __func__, aPLAYMODE[PlayMode]);
 	pm = PlayMode;
 	fn_ts = "";
 	fn_xml = "";
 	last_size = 0;
-	pd->speed = 0;
+	nPlaybackSpeed = 0;
 	init_jump = -1;
 
 	return 0;
@@ -93,22 +46,20 @@ void cPlayback::Close(void)
 	Stop();
 	if (decoders_closed)
 	{
-		adec->openDevice();
-		videoDecoder->vdec->openDevice();
+		audioDecoder->openDevice();
+		videoDecoder->openDevice();
 		decoders_closed = false;
 	}
 }
 
-bool cPlayback::Start(char *filename, unsigned short vpid, int vtype, unsigned short apid, int ac3, unsigned int)
+bool cPlayback::Start(char *filename, int vpid, int vtype, int apid, int ac3, int)
 {
 	bool ret = false;
 	bool isHTTP = false;
-	bool no_probe = false;
+	no_probe = false;
 
-	lt_info("%s - filename=%s vpid=%u vtype=%d apid=%u ac3=%d\n",
-		__func__, filename, vpid, vtype, apid, ac3);
+	lt_info("%s - filename=%s vpid=%u vtype=%d apid=%u ac3=%d\n", __func__, filename, vpid, vtype, apid, ac3);
 
-	Player *player = pd->player;
 	init_jump = -1;
 
 	std::string file;
@@ -128,19 +79,18 @@ bool cPlayback::Start(char *filename, unsigned short vpid, int vtype, unsigned s
 
 	if (player->Open(file.c_str(), no_probe)) {
 		if (pm == PLAYMODE_TS) {
-			struct stat s;
-			if (!stat(file.c_str(), &s))
+			struct stat64 s;
+			if (!stat64(file.c_str(), &s))
 				last_size = s.st_size;
 			ret = true;
-			videoDecoder->vdec->Stop(false);
-			adec->Stop();
+			videoDecoder->Stop(false);
+			audioDecoder->Stop();
 		} else {
 			std::vector<std::string> keys, values;
 			int selected_program = 0;
 			if (vpid || apid) {
 				;
-#if 0
-			} else if (player->GetPrograms(keys, values) && (keys.size() > 1) && ProgramSelectionCallback) {
+			} else if (GetPrograms(keys, values) && (keys.size() > 1) && ProgramSelectionCallback) {
 				const char *key = ProgramSelectionCallback(ProgramSelectionCallbackData, keys, values);
 				if (!key) {
 					player->Close();
@@ -149,38 +99,18 @@ bool cPlayback::Start(char *filename, unsigned short vpid, int vtype, unsigned s
 				selected_program = atoi(key);
 			} else if (keys.size() > 0)
 				selected_program = atoi(keys[0].c_str());
-#else
-			} else {
-				player->GetPrograms(keys, values);
-				if (keys.size() > 0) {
-					selected_program = atoi(keys[0].c_str());
-					int max_br = INT_MAX;
-					char *env = getenv("STREAM_MAXBITRATE");
-					if (env)
-						max_br = atoi(env);
-					for (unsigned i = 0; i < keys.size(); i++) {
-						lt_info("%s: stream: '%s' value: '%s'\n",
-							__func__, keys[i].c_str(), values[i].c_str());
-						int bitrate = atoi(values[i].c_str()); /* '1234 kbit/s' */
-						if (bitrate <= max_br)
-							selected_program = atoi(keys[i].c_str());
-					}
-					lt_info("%s: selected_program: '%d'\n", __func__, selected_program);
-				}
-			}
-#endif
 
 			if (!keys.size() || !player->SelectProgram(selected_program)) {
 				if (apid)
-					player->SwitchAudio(apid);
+					SetAPid(apid);
 				if (vpid)
-					player->SwitchVideo(vpid);
+					SetVPid(vpid);
 			}
-			pd->playing = true;
+			playing = true;
 			player->output.Open();
 			ret = player->Play();
 			if (ret && !isHTTP)
-				pd->playing = ret = player->Pause();
+				playing = ret = player->Pause();
 		}
 	}
 
@@ -189,45 +119,57 @@ bool cPlayback::Start(char *filename, unsigned short vpid, int vtype, unsigned s
 
 bool cPlayback::Stop(void)
 {
-	lt_info("%s playing %d\n", __func__, pd->playing);
-	Player *player = pd->player;
+	lt_info("%s playing %d\n", __func__, playing);
 
 	player->Stop();
 	player->output.Close();
 	player->Close();
 
-	pd->playing = false;
+	playing = false;
 	return true;
 }
 
-bool cPlayback::SetAPid(unsigned short pid, int /*ac3*/)
+bool cPlayback::SetAPid(int pid, bool /* ac3 */)
 {
 	lt_info("%s\n", __func__);
-	return pd->player->SwitchAudio(pid);
+	return player->SwitchAudio(pid);
+}
+
+bool cPlayback::SetVPid(int pid)
+{
+	return player->SwitchVideo(pid);
+}
+
+bool cPlayback::SetSubtitlePid(int pid)
+{
+	return player->SwitchSubtitle(pid);
+}
+
+bool cPlayback::SetTeletextPid(int pid)
+{
+	return player->SwitchTeletext(pid);
 }
 
 bool cPlayback::SetSpeed(int speed)
 {
-	lt_info("%s playing %d speed %d\n", __func__, pd->playing, speed);
+	lt_info("%s playing %d speed %d\n", __func__, playing, speed);
 
-	Player *player = pd->player;
-
-	if (! decoders_closed)
+	if (!decoders_closed)
 	{
-		adec->closeDevice();
-		videoDecoder->vdec->closeDevice();
+		audioDecoder->closeDevice();
+		videoDecoder->closeDevice();
 		decoders_closed = true;
 		usleep(500000);
 		player->output.Open();
-		pd->playing = player->Play();
+		playing = player->Play();
 	}
 
-	if (!pd->playing)
+	if (!playing)
 		return false;
 
 	bool res = true;
 
-	pd->speed = speed;
+	nPlaybackSpeed = speed;
 
 	if (speed > 1) {
 		/* direction switch ? */
@@ -260,39 +202,36 @@ bool cPlayback::SetSpeed(int speed)
 bool cPlayback::GetSpeed(int &speed) const
 {
 	lt_debug("%s\n", __func__);
-	speed = pd->speed;
+	speed = nPlaybackSpeed;
 	return true;
 }
 
-#if 0
 void cPlayback::GetPts(uint64_t &pts)
 {
-	pd->player->GetPts((int64_t &) pts);
+	player->GetPts((int64_t &) pts);
 }
-#endif
 
 // in milliseconds
 bool cPlayback::GetPosition(int &position, int &duration)
 {
 	bool got_duration = false;
 	lt_debug("%s %d %d\n", __func__, position, duration);
-	Player *player = pd->player;
 
 	/* hack: if the file is growing (timeshift), then determine its length
 	 * by comparing the mtime with the mtime of the xml file */
 	if (pm == PLAYMODE_TS)
 	{
-		struct stat s;
-		if (!stat(fn_ts.c_str(), &s))
+		struct stat64 s;
+		if (!stat64(fn_ts.c_str(), &s))
 		{
-			if (!pd->playing || last_size != s.st_size)
+			if (!playing || last_size != s.st_size)
 			{
 				last_size = s.st_size;
 				time_t curr_time = s.st_mtime;
-				if (!stat(fn_xml.c_str(), &s))
+				if (!stat64(fn_xml.c_str(), &s))
 				{
 					duration = (curr_time - s.st_mtime) * 1000;
-					if (!pd->playing)
+					if (!playing)
 						return true;
 					got_duration = true;
 				}
@@ -300,15 +239,15 @@ bool cPlayback::GetPosition(int &position, int &duration)
 		}
 	}
 
-	if (!pd->playing)
+	if (!playing)
 		return false;
 
 	if (!player->isPlaying) {
 		lt_info("%s !!!!EOF!!!! < -1\n", __func__);
-		position = duration;
+		position = duration + 1000;
 		// duration = 0;
 		// this is stupid
-		return true;
+		return false;
 	}
 
 	int64_t vpts = 0;
@@ -339,7 +278,7 @@ bool cPlayback::GetPosition(int &position, int &duration)
 bool cPlayback::SetPosition(int position, bool absolute)
 {
 	lt_info("%s %d\n", __func__, position);
-	if (!pd->playing)
+	if (!playing)
 	{
 		/* the calling sequence is:
 		 * Start()       - paused
@@ -350,27 +289,26 @@ bool cPlayback::SetPosition(int position, bool absolute)
 		init_jump = position;
 		return false;
 	}
-	pd->player->Seek((int64_t)position * (AV_TIME_BASE / 1000), absolute);
+	player->Seek((int64_t)position * (AV_TIME_BASE / 1000), absolute);
 	return true;
 }
 
-void cPlayback::FindAllPids(uint16_t *pids, unsigned short *ac3flags, uint16_t *numpida, std::string *language)
+void cPlayback::FindAllPids(int *pids, unsigned int *ac3flags, unsigned int *numpids, std::string *language)
 {
 	lt_info("%s\n", __func__);
 	unsigned int i = 0;
 
-	std::vector<Track> tracks = pd->player->manager.getAudioTracks();
-	for (std::vector<Track>::iterator it = tracks.begin(); it != tracks.end() && i < MAX_PLAYBACK_PIDS; ++it) {
+	std::vector<Track> tracks = player->manager.getAudioTracks();
+	for (std::vector<Track>::iterator it = tracks.begin(); it != tracks.end() && i < *numpids; ++it) {
 		pids[i] = it->pid;
 		ac3flags[i] = it->ac3flags;
 		language[i] = it->title;
 		i++;
 	}
-	*numpida = i;
+	*numpids = i;
 }
 
-#if 0
-void cPlayback::FindAllSubtitlePids(uint16_t *pids, uint16_t *numpids, std::string *language)
+void cPlayback::FindAllSubtitlePids(int *pids, unsigned int *numpids, std::string *language)
 {
 	lt_info("%s\n", __func__);
 	unsigned int i = 0;
@@ -414,31 +352,15 @@ int cPlayback::GetFirstTeletextPid(void)
 	return -1;
 }
 
-unsigned short cPlayback::GetTeletextPid(void)
-{
-	lt_info("%s\n", __func__);
-	return pd->player->GetTeletextPid();
-}
-#endif
-
 /* dummy functions for subtitles */
 void cPlayback::FindAllSubs(uint16_t * /*pids*/, unsigned short * /*supp*/, uint16_t *num, std::string * /*lang*/)
 {
 	*num = 0;
 }
 
-bool cPlayback::SelectSubtitles(int pid)
+bool cPlayback::SelectSubtitles(int /*pid*/)
 {
-	lt_info("%s pid %d\n", __func__, pid);
 	return false;
-}
-
-void cPlayback::GetChapters(std::vector<int> &positions, std::vector<std::string> &titles)
-{
-	positions.clear();
-	titles.clear();
-
-	pd->player->GetChapters(positions, titles);
 }
 
 void cPlayback::GetTitles(std::vector<int> &playlists, std::vector<std::string> &titles, int &current)
@@ -452,39 +374,91 @@ void cPlayback::SetTitle(int /*title*/)
 {
 }
 
-void cPlayback::RequestAbort(void)
+void cPlayback::GetChapters(std::vector<int> &positions, std::vector<std::string> &titles)
 {
+	player->GetChapters(positions, titles);
 }
 
-//
-cPlayback::cPlayback(int /*num*/)
+void cPlayback::GetMetadata(std::vector<std::string> &keys, std::vector<std::string> &values)
+{
+	player->input.GetMetadata(keys, values);
+}
+
+cPlayback::cPlayback(int num __attribute__((unused)))
 {
 	lt_info("%s\n", __func__);
-	pd = new PBPrivate();
+	playing = false;
+	decoders_closed = false;
+	ProgramSelectionCallback = NULL;
+	ProgramSelectionCallbackData = NULL;
+
+	player = new Player();
 }
 
 cPlayback::~cPlayback()
 {
 	lt_info("%s\n", __func__);
-	delete pd;
-	pd = NULL;
+	delete player;
 }
 
-#if 0
-bool cPlayback::IsPlaying(void) const
+void cPlayback::RequestAbort() {
+	player->RequestAbort();
+	while (player->isPlaying)
+		usleep(100000);
+}
+
+bool cPlayback::IsPlaying() {
+	return player->isPlaying;
+}
+
+uint64_t cPlayback::GetReadCount() {
+	return player->readCount;
+}
+
+int cPlayback::GetAPid(void)
 {
 	lt_info("%s\n", __func__);
-
-	/* konfetti: there is no event/callback mechanism in libeplayer2
-	 * so in case of ending playback we have no information on a 
-	 * terminated stream currently (or did I oversee it?).
-	 * So let's ask the player the state.
-	 */
-	if (playing)
-	{
-	   return player->playback->isPlaying;
-	}
-
-	return playing;
+	return player->GetAudioPid();
 }
-#endif
+
+int cPlayback::GetVPid(void)
+{
+	return player->GetVideoPid();
+}
+
+int cPlayback::GetSubtitlePid(void)
+{
+	return player->GetSubtitlePid();
+}
+
+int cPlayback::GetTeletextPid(void)
+{
+	return player->GetTeletextPid();
+}
+
+AVFormatContext *cPlayback::GetAVFormatContext()
+{
+	return player ? player->GetAVFormatContext() : NULL;
+}
+
+void cPlayback::ReleaseAVFormatContext()
+{
+	if (player)
+		player->ReleaseAVFormatContext();
+}
+
+bool cPlayback::GetPrograms(std::vector<std::string> &keys, std::vector<std::string> &values)
+{
+	return player->GetPrograms(keys, values);
+}
+
+bool cPlayback::SelectProgram(std::string &key)
+{
+	return player->SelectProgram(key);
+}
+
+void cPlayback::SetProgramSelectionCallback(const char *(*fun)(void *, std::vector<std::string> &keys, std::vector<std::string> &values), void *opaque)
+{
+	ProgramSelectionCallback = fun;
+	ProgramSelectionCallbackData = opaque;
+}

@@ -4,7 +4,7 @@
  *
  * derived from libtriple/dmx_td.cpp
  *
- * (C) 2010-2013,2015 Stefan Seyfried
+ * (C) 2010-2013 Stefan Seyfried
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -66,26 +66,26 @@
 #include <cstring>
 #include <cstdio>
 #include <string>
-#include <sys/ioctl.h>
-#include <OpenThreads/Mutex>
-#include <OpenThreads/ScopedLock>
-#include "dmx_hal.h"
+#include "dmx_lib.h"
 #include "lt_debug.h"
 
-#include "video_priv.h"
-/* needed for getSTC... */
+/* Ugh... see comment in destructor for details... */
+#include "video_lib.h"
 extern cVideo *videoDecoder;
 
 #define lt_debug(args...) _lt_debug(TRIPLE_DEBUG_DEMUX, this, args)
 #define lt_info(args...) _lt_info(TRIPLE_DEBUG_DEMUX, this, args)
-#define lt_debug_c(args...) _lt_debug(TRIPLE_DEBUG_DEMUX, NULL, args)
 #define lt_info_c(args...) _lt_info(TRIPLE_DEBUG_DEMUX, NULL, args)
-#define lt_info_z(args...) _lt_info(TRIPLE_DEBUG_DEMUX, thiz, args)
-#define lt_debug_z(args...) _lt_debug(TRIPLE_DEBUG_DEMUX, thiz, args)
 
 #define dmx_err(_errfmt, _errstr, _revents) do { \
+	uint16_t _pid = (uint16_t)-1; uint16_t _f = 0;\
+	if (dmx_type == DMX_PSI_CHANNEL) { \
+		_pid = s_flt.pid; _f = s_flt.filter.filter[0]; \
+	} else { \
+		_pid = p_flt.pid; \
+	}; \
 	lt_info("%s " _errfmt " fd:%d, ev:0x%x %s pid:0x%04hx flt:0x%02hx\n", \
-		__func__, _errstr, fd, _revents, DMX_T[dmx_type], pid, flt); \
+		__func__, _errstr, fd, _revents, DMX_T[dmx_type], _pid, _f); \
 } while(0);
 
 cDemux *videoDemux = NULL;
@@ -119,11 +119,9 @@ static const char *devname[NUM_DEMUXDEV] = {
 /* did we already DMX_SET_SOURCE on that demux device? */
 static bool init[NUM_DEMUXDEV] = { false, false, false };
 
-typedef struct dmx_pdata {
-	int last_source;
-	OpenThreads::Mutex *mutex;
-} dmx_pdata;
-#define P ((dmx_pdata *)pdata)
+/* uuuugly */
+static int dmx_tp_count = 0;
+#define MAX_TS_COUNT 1
 
 cDemux::cDemux(int n)
 {
@@ -135,22 +133,28 @@ cDemux::cDemux(int n)
 	else
 		num = n;
 	fd = -1;
-	pdata = (void *)calloc(1, sizeof(dmx_pdata));
-	P->last_source = -1;
-	P->mutex = new OpenThreads::Mutex;
-	dmx_type = DMX_INVALID;
+	measure = false;
+	last_measure = 0;
+	last_data = 0;
+	last_source = -1;
 }
 
 cDemux::~cDemux()
 {
 	lt_debug("%s #%d fd: %d\n", __FUNCTION__, num, fd);
 	Close();
-	/* wait until Read() has released the mutex */
-	(*P->mutex).lock();
-	(*P->mutex).unlock();
-	free(P->mutex);
-	free(pdata);
-	pdata = NULL;
+	/* in zapit.cpp, videoDemux is deleted after videoDecoder
+	 * in the video watchdog, we access videoDecoder
+	 * the thread still runs after videoDecoder has been deleted
+	 * => set videoDecoder to NULL here to make the check in the
+	 * watchdog thread pick this up.
+	 * This is ugly, but it saves me from changing neutrino
+	 *
+	 * if the delete order in neutrino will ever be changed, this
+	 * will blow up badly :-(
+	 */
+	if (dmx_type == DMX_VIDEO_CHANNEL)
+		videoDecoder = NULL;
 }
 
 bool cDemux::Open(DMX_CHANNEL_TYPE pes_type, void * /*hVideoBuffer*/, int uBufferSize)
@@ -165,18 +169,18 @@ bool cDemux::Open(DMX_CHANNEL_TYPE pes_type, void * /*hVideoBuffer*/, int uBuffe
 	return true;
 }
 
-static bool _open(cDemux *thiz, int num, int &fd, int &last_source, DMX_CHANNEL_TYPE dmx_type, int buffersize)
+bool cDemux::_open(void)
 {
 	int flags = O_RDWR|O_CLOEXEC;
 	int devnum = dmx_source[num];
 	if (last_source == devnum) {
-		lt_debug_z("%s #%d: source (%d) did not change\n", __func__, num, last_source);
+		lt_debug("%s #%d: source (%d) did not change\n", __func__, num, last_source);
 		if (fd > -1)
 			return true;
 	}
 	if (fd > -1) {
 		/* we changed source -> close and reopen the fd */
-		lt_debug_z("%s #%d: FD ALREADY OPENED fd = %d lastsource %d devnum %d\n",
+		lt_debug("%s #%d: FD ALREADY OPENED fd = %d lastsource %d devnum %d\n",
 				__func__, num, fd, last_source, devnum);
 		close(fd);
 	}
@@ -187,10 +191,10 @@ static bool _open(cDemux *thiz, int num, int &fd, int &last_source, DMX_CHANNEL_
 	fd = open(devname[devnum], flags);
 	if (fd < 0)
 	{
-		lt_info_z("%s %s: %m\n", __FUNCTION__, devname[devnum]);
+		lt_info("%s %s: %m\n", __FUNCTION__, devname[devnum]);
 		return false;
 	}
-	lt_debug_z("%s #%d pes_type: %s(%d), uBufferSize: %d fd: %d\n", __func__,
+	lt_debug("%s #%d pes_type: %s(%d), uBufferSize: %d fd: %d\n", __func__,
 		 num, DMX_T[dmx_type], dmx_type, buffersize, fd);
 
 	/* this would actually need locking, but the worst that weill happen is, that
@@ -199,17 +203,19 @@ static bool _open(cDemux *thiz, int num, int &fd, int &last_source, DMX_CHANNEL_
 	{
 		/* this should not change anything... */
 		int n = DMX_SOURCE_FRONT0 + devnum;
-		lt_info_z("%s: setting %s to source %d\n", __func__, devname[devnum], n);
+		lt_info("%s: setting %s to source %d\n", __func__, devname[devnum], n);
 		if (ioctl(fd, DMX_SET_SOURCE, &n) < 0)
-			lt_info_z("%s DMX_SET_SOURCE failed!\n", __func__);
+			lt_info("%s DMX_SET_SOURCE failed!\n", __func__);
 		else
 			init[devnum] = true;
 	}
+	if (buffersize == 0)
+		buffersize = 0xffff; // may or may not be reasonable  --martii
 	if (buffersize > 0)
 	{
 		/* probably uBufferSize == 0 means "use default size". TODO: find a reasonable default */
 		if (ioctl(fd, DMX_SET_BUFFER_SIZE, buffersize) < 0)
-			lt_info_z("%s DMX_SET_BUFFER_SIZE failed (%m)\n", __func__);
+			lt_info("%s DMX_SET_BUFFER_SIZE failed (%m)\n", __func__);
 	}
 
 	last_source = devnum;
@@ -229,6 +235,17 @@ void cDemux::Close(void)
 	ioctl(fd, DMX_STOP);
 	close(fd);
 	fd = -1;
+	if (measure)
+		return;
+	if (dmx_type == DMX_TP_CHANNEL)
+	{
+		dmx_tp_count--;
+		if (dmx_tp_count < 0)
+		{
+			lt_info("%s dmx_tp_count < 0!!\n", __func__);
+			dmx_tp_count = 0;
+		}
+	}
 }
 
 bool cDemux::Start(bool)
@@ -265,8 +282,6 @@ int cDemux::Read(unsigned char *buff, int len, int timeout)
 		lt_info("%s #%d: not open!\n", __func__, num);
 		return -1;
 	}
-	/* avoid race in destructor: ~cDemux needs to wait until Read() returns */
-	OpenThreads::ScopedLock<OpenThreads::Mutex> m_lock(*P->mutex);
 	int rc;
 	int to = timeout;
 	struct pollfd ufds;
@@ -284,12 +299,6 @@ int cDemux::Read(unsigned char *buff, int len, int timeout)
 	{
  retry:
 		rc = ::poll(&ufds, 1, to);
-		if (ufds.fd != fd)
-		{
-			/* Close() will set fd to -1, this is normal. Everything else is not. */
-			lt_info("%s:1 ========== fd has changed, %d->%d ==========\n", __func__, ufds.fd, fd);
-			return -1;
-		}
 		if (!rc)
 		{
 			if (timeout == 0) /* we took the emergency exit */
@@ -327,11 +336,6 @@ int cDemux::Read(unsigned char *buff, int len, int timeout)
 			return 0;
 		}
 	}
-	if (ufds.fd != fd)	/* does this ever happen? and if, is it harmful? */
-	{			/* read(-1,...) will just return EBADF anyway... */
-		lt_info("%s:2 ========== fd has changed, %d->%d ==========\n", __func__, ufds.fd, fd);
-		return -1;
-	}
 
 	rc = ::read(fd, buff, len);
 	//fprintf(stderr, "fd %d ret: %d\n", fd, rc);
@@ -341,22 +345,19 @@ int cDemux::Read(unsigned char *buff, int len, int timeout)
 	return rc;
 }
 
-bool cDemux::sectionFilter(unsigned short _pid, const unsigned char * const filter,
+bool cDemux::sectionFilter(unsigned short pid, const unsigned char * const filter,
 			   const unsigned char * const mask, int len, int timeout,
 			   const unsigned char * const negmask)
 {
-	struct dmx_sct_filter_params s_flt;
 	memset(&s_flt, 0, sizeof(s_flt));
-	pid = _pid;
 
-	_open(this, num, fd, P->last_source, dmx_type, buffersize);
+	_open();
 
 	if (len > DMX_FILTER_SIZE)
 	{
 		lt_info("%s #%d: len too long: %d, DMX_FILTER_SIZE %d\n", __func__, num, len, DMX_FILTER_SIZE);
 		len = DMX_FILTER_SIZE;
 	}
-	flt = filter[0];
 	s_flt.pid = pid;
 	s_flt.timeout = timeout;
 	memcpy(s_flt.filter.filter, filter, len);
@@ -461,11 +462,8 @@ bool cDemux::sectionFilter(unsigned short _pid, const unsigned char * const filt
 	return true;
 }
 
-bool cDemux::pesFilter(const unsigned short _pid)
+bool cDemux::pesFilter(const unsigned short pid)
 {
-	struct dmx_pes_filter_params p_flt;
-	pid = _pid;
-	flt = 0;
 	/* allow PID 0 for web streaming e.g.
 	 * this check originally is from tuxbox cvs but I'm not sure
 	 * what it is good for...
@@ -477,7 +475,7 @@ bool cDemux::pesFilter(const unsigned short _pid)
 
 	lt_debug("%s #%d pid: 0x%04hx fd: %d type: %s\n", __FUNCTION__, num, pid, fd, DMX_T[dmx_type]);
 
-	_open(this, num, fd, P->last_source, dmx_type, buffersize);
+	_open();
 
 	memset(&p_flt, 0, sizeof(p_flt));
 	p_flt.pid = pid;
@@ -540,7 +538,7 @@ bool cDemux::addPid(unsigned short Pid)
 		lt_info("%s pes_type %s not implemented yet! pid=%hx\n", __FUNCTION__, DMX_T[dmx_type], Pid);
 		return false;
 	}
-	_open(this, num, fd, P->last_source, dmx_type, buffersize);
+	_open();
 	if (fd == -1)
 		lt_info("%s bucketfd not yet opened? pid=%hx\n", __FUNCTION__, Pid);
 	pfd.fd = fd; /* dummy */
@@ -548,7 +546,7 @@ bool cDemux::addPid(unsigned short Pid)
 	pesfds.push_back(pfd);
 	ret = (ioctl(fd, DMX_ADD_PID, &Pid));
 	if (ret < 0)
-		lt_info("%s: DMX_ADD_PID (%m)\n", __func__);
+		lt_info("%s: DMX_ADD_PID (%m) pid=%hx\n", __func__, Pid);
 	return (ret != -1);
 }
 
@@ -579,7 +577,7 @@ void cDemux::getSTC(int64_t * STC)
 	lt_debug("%s #%d\n", __func__, num);
 	int64_t pts = 0;
 	if (videoDecoder)
-		pts = videoDecoder->vdec->GetPTS();
+		pts = videoDecoder->GetPTS();
 	*STC = pts;
 }
 
@@ -598,7 +596,7 @@ bool cDemux::SetSource(int unit, int source)
 		lt_info_c("%s: unit (%d) out of range, NUM_DEMUX %d\n", __func__, unit, NUM_DEMUX);
 		return false;
 	}
-	lt_debug_c("%s(%d, %d) => %d to %d\n", __func__, unit, source, dmx_source[unit], source);
+	lt_info_c("%s(%d, %d) => %d to %d\n", __func__, unit, source, dmx_source[unit], source);
 	if (source < 0 || source >= NUM_DEMUXDEV)
 		lt_info_c("%s(%d, %d) ERROR: source %d out of range!\n", __func__, unit, source, source);
 	else
@@ -612,6 +610,6 @@ int cDemux::GetSource(int unit)
 		lt_info_c("%s: unit (%d) out of range, NUM_DEMUX %d\n", __func__, unit, NUM_DEMUX);
 		return -1;
 	}
-	lt_debug_c("%s(%d) => %d\n", __func__, unit, dmx_source[unit]);
+	lt_info_c("%s(%d) => %d\n", __func__, unit, dmx_source[unit]);
 	return dmx_source[unit];
 }
